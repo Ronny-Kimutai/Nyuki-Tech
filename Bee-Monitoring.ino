@@ -10,15 +10,15 @@
 // Have to be in the same folder
 #include "utilities.h"
 
+// Select your modem
+#define TINY_GSM_MODEM_SIM800
+
 // Libraries
 #include <TinyGsmClient.h>
 #include <PubSubClient.h>
 #include <DHT.h>
 #include <time.h>
 #include "esp_sleep.h" // Power Management
-
-// Select your modem
-#define TINY_GSM_MODEM_SIM800
 
 // Set Serial for Serial Monitor and AT Commands
 #define SerialMonitor Serial
@@ -105,13 +105,13 @@ const uint32_t ENCODED_DEVICE_ID = DEVICE_BASE_ID + DEVICE_NUMBER;
 
 // Timing Configuration
 // Comment Out to set it in Development Mode
-// #define DEVELOPMENT_MODE true  
+//#define DEVELOPMENT_MODE true  
 #ifdef DEVELOPMENT_MODE
   const int MEASUREMENT_INTERVAL = 10; 
   const int TRANSMISSION_INTERVAL = 80;
   const char* mode_name = "DEVELOPMENT";
 #else
-  const int MEASUREMENT_INTERVAL = 150; 
+  const int MEASUREMENT_INTERVAL = 900; 
   const int TRANSMISSION_INTERVAL = 1200; 
   const char* mode_name = "PRODUCTION";
 #endif
@@ -647,7 +647,7 @@ void takeMeasurement() {
   
   // Read battery voltage and percentage
   int analogVal = analogRead(BATTERY_ADC_PIN);
-  float inputVoltage = ((float(analogVal)/4096) * 3.3) * 2.068;
+  float inputVoltage = readBatteryVoltage();
   int batteryPercent = getBatteryPercentage(inputVoltage);
   
   payload.temperature = temp;
@@ -796,7 +796,7 @@ void displaySystemStatus() {
   
   // Show current battery status
   int analogVal = analogRead(BATTERY_ADC_PIN);
-  float inputVoltage = ((float(analogVal)/4096) * 3.3) * 2.068;
+  float inputVoltage = readBatteryVoltage();
   int batteryPercent = getBatteryPercentage(inputVoltage);
   SerialMonitor.printf("Battery: %.2fV (%d%%)\n", inputVoltage, batteryPercent);
   
@@ -1011,4 +1011,22 @@ int getBatteryPercentage(float voltage) {
   if (voltage >= 3.6) return 20;
   if (voltage >= 3.4) return 10;
   return 0;
+}
+
+float readBatteryVoltage() {
+  // Take multiple samples and average them to reduce noise
+  const int NUM_SAMPLES = 10;
+  int sum = 0;
+  
+  for (int i = 0; i < NUM_SAMPLES; i++) {
+    sum += analogRead(BATTERY_ADC_PIN);
+    delay(10); // Small delay between samples
+  }
+  
+  float avgAnalogVal = sum / (float)NUM_SAMPLES;
+  
+  // Use your existing formula but with averaged reading
+  float inputVoltage = ((avgAnalogVal / 4096.0) * 3.3) * 2.068;
+  
+  return inputVoltage;
 }
