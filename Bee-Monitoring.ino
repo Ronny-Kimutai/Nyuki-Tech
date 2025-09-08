@@ -19,6 +19,14 @@
 #include <DHT.h>
 #include <time.h>
 #include "esp_sleep.h" // Power Management
+#include "esp_adc_cal.h" // Battery
+#include "esp_task_wdt.h" //Watchdog
+
+#define WDT_TIMEOUT 30  // 30 seconds timeout
+#define WDT_RESET_INTERVAL 5000  // Reset every 5 seconds (more frequent)
+
+unsigned long lastWdtReset = 0;
+bool watchdogInitialized = false;  // Track initialization state
 
 // Set Serial for Serial Monitor and AT Commands
 #define SerialMonitor Serial
@@ -52,8 +60,6 @@ TinyGsm modem(SerialAT);
 TinyGsmClient client(modem);
 PubSubClient mqtt(client);
 
-// Battery monitoring configuration
-#define BATTERY_ADC_PIN 35
 
 // BCD DateTime Structure
 struct BCDDateTime {
@@ -105,14 +111,14 @@ const uint32_t ENCODED_DEVICE_ID = DEVICE_BASE_ID + DEVICE_NUMBER;
 
 // Timing Configuration
 // Comment Out to set it in Development Mode
-//#define DEVELOPMENT_MODE true  
-#ifdef DEVELOPMENT_MODE
+// #define DEVELOPMENT_MODE true  
+ #ifdef DEVELOPMENT_MODE
   const int MEASUREMENT_INTERVAL = 10; 
   const int TRANSMISSION_INTERVAL = 80;
   const char* mode_name = "DEVELOPMENT";
 #else
   const int MEASUREMENT_INTERVAL = 900; 
-  const int TRANSMISSION_INTERVAL = 1200; 
+  const int TRANSMISSION_INTERVAL = 7200; 
   const char* mode_name = "PRODUCTION";
 #endif
 
@@ -130,9 +136,18 @@ unsigned long lastMeasurement = 0;
 unsigned long lastTransmission = 0;
 const unsigned long TIME_SYNC_INTERVAL = 3600000;
 
+// Battery Configuration
+#define BATTERY_ADC_PIN 35
+const float ADC_VREF = 3.3;         
+const int ADC_RESOLUTION = 4096;
+
+const float R1 = 10000;  
+const float R2 = 10000;  
+const float VOLTAGE_DIVIDER_RATIO = (R1 + R2) / R2; 
+
 void setup() {
     SerialMonitor.begin(115200);
-    delay(10);
+    delay(100);
 
     handleWakeUp();
     
@@ -143,6 +158,12 @@ void setup() {
 
     dht.begin();
     SerialMonitor.println("DHT sensor initialized");
+
+    initializeBatteryADC();
+
+    // Initialize watchdog only once
+    initializeWatchdog();
+    feedWatchdog();
 
     // Initialize basic time
     struct tm tm;
@@ -155,9 +176,14 @@ void setup() {
     tm.tm_isdst = 0;
     time_t t = mktime(&tm);
     
+    feedWatchdog();
+    
     setupModemAndNetwork();
+    feedWatchdog();
+    
     if (networkConnected) {
         connectMQTT();
+        feedWatchdog();
     }
     
     SerialMonitor.println("✓ System initialized successfully");
@@ -165,29 +191,44 @@ void setup() {
     unsigned long currentTime = millis();
     lastMeasurement = currentTime - (MEASUREMENT_INTERVAL * 1000UL) - 1000;
     lastTransmission = currentTime;
+    lastWdtReset = currentTime;  // Initialize watchdog reset timer
     
     SerialMonitor.println("=== SYSTEM READY ===");
     SerialMonitor.printf("Device: %s (ID: %lu)\n", deviceName, ENCODED_DEVICE_ID);
     SerialMonitor.printf("RTC Buffer: %d/%d payloads\n", bufferIndex, PAYLOAD_BUFFER_SIZE);
     SerialMonitor.println("Ready to send BCD data with battery monitoring via RTC buffer");
     SerialMonitor.println("================================");
+    
+    feedWatchdog();
 }
 
 void loop() {
     unsigned long currentTime = millis();
 
-    // ✅ FIXED: Handle post-wake-up state properly
+    // Feed watchdog more frequently
+    if (currentTime - lastWdtReset >= WDT_RESET_INTERVAL) {
+        feedWatchdog();
+        lastWdtReset = currentTime;
+        
+        #ifdef DEVELOPMENT_MODE
+        SerialMonitor.println("🐕 Watchdog fed"); // Only show in dev mode
+        #endif
+    }
+
+    // Handle post-wake-up state properly
     static bool hasHandledWakeupInLoop = false;
-    
+
     // Only run wake-up handling once per boot cycle in loop
     if (!hasHandledWakeupInLoop) {
         // Check if we need to re-establish connections after wake-up
         if (bootCount > 1 && !networkConnected) {
             SerialMonitor.println("=== POST-WAKE-UP RECONNECTION ===");
             setupModemAndNetwork();
+            feedWatchdog();
             
             if (networkConnected && !mqtt.connected()) {
                 connectMQTT();
+                feedWatchdog();
             }
         }
         hasHandledWakeupInLoop = true;
@@ -198,14 +239,17 @@ void loop() {
         SerialMonitor.println("Network disconnected - attempting reconnection");
         networkConnected = false;
         setupModemAndNetwork();
+        feedWatchdog();
         
         if (networkConnected && !mqtt.connected()) {
             connectMQTT();
+            feedWatchdog();
         }
         return;
     }
 
     handleSerialCommands();
+    feedWatchdog(); // Feed after potentially blocking serial operations
     
     // Debug output
     static unsigned long lastDebug = 0;
@@ -220,25 +264,28 @@ void loop() {
                       bufferIndex, PAYLOAD_BUFFER_SIZE,
                       ((MEASUREMENT_INTERVAL * 1000UL) - (currentTime - lastMeasurement)) / 1000);
         lastDebug = currentTime;
+        feedWatchdog();
     }
     
     if (!mqtt.connected() && networkConnected) {
         connectMQTT();
+        feedWatchdog();
         delay(100);
     }
     
-    // ✅ FIXED: Measurement check with buffer overflow protection
+    // Measurement check with buffer overflow protection
     if (currentTime - lastMeasurement >= (MEASUREMENT_INTERVAL * 1000UL)) {
         SerialMonitor.println("=== MEASUREMENT TIME ===");
         takeMeasurement();
+        feedWatchdog();
         lastMeasurement = currentTime;
     }
     
-    // ✅ FIXED: Transmission check with duplicate prevention
+    // Transmission check with duplicate prevention
     bool timeForTransmission = (currentTime - lastTransmission >= (TRANSMISSION_INTERVAL * 1000UL));
     bool bufferNeedsTransmission = (bufferIndex >= PAYLOAD_BUFFER_SIZE);
     
-    // ✅ CRITICAL: Prevent rapid successive transmission calls
+    // Prevent rapid successive transmission calls
     static unsigned long lastTransmissionAttempt = 0;
     const unsigned long MIN_TRANSMISSION_GAP = 5000; // 5 seconds minimum between attempts
     
@@ -254,10 +301,12 @@ void loop() {
         }
         
         lastTransmissionAttempt = currentTime; // Record attempt time
+        feedWatchdog();
         
         if (!networkConnected) {
             SerialMonitor.println("Network not connected, attempting reconnection...");
             setupModemAndNetwork();
+            feedWatchdog();
         }
         
         if (networkConnected && bufferIndex > 0) {
@@ -273,6 +322,7 @@ void loop() {
             if (hasUntransmitted) {
                 SerialMonitor.println("📤 Starting transmission of untransmitted payloads...");
                 transmitPayloads();
+                feedWatchdog();
                 lastTransmission = currentTime;
             } else {
                 SerialMonitor.println("ℹ All payloads already transmitted, skipping");
@@ -298,15 +348,17 @@ void loop() {
         if (syncPreciseNetworkTime()) {
             lastTimeSync = currentTime;
         }
+        feedWatchdog();
     }
 
     if (networkConnected && mqtt.connected()) {
         mqtt.loop();
     }
     
+    feedWatchdog();
     delay(1000);
     
-    // ✅ FIXED: Deep sleep decision with better logic
+    // Deep sleep decision with better logic
     if (shouldEnterDeepSleep()) {
         SerialMonitor.println("✓ Conditions met for deep sleep");
         enterDeepSleep();
@@ -344,12 +396,14 @@ bool syncPreciseNetworkTime() {
   SerialMonitor.println("Syncing time with cellular network...");
   
   modem.sendAT("+CLTS=1");
+  feedWatchdog();
   if (modem.waitResponse(10000L) != 1) {
     SerialMonitor.println("Failed to enable network time sync");
     return false;
   }
   
   delay(2000);
+  feedWatchdog();
   
   modem.sendAT("+CCLK?");
   String response = "";
@@ -515,9 +569,10 @@ bool transmitBCDFrame(SensorPayload& payload) {
   } else {
     transmissionTime = time(nullptr);
   }
-  payload.transmitted_time = transmissionTime;  // NEW: Record when transmitted
+  payload.transmitted_time = transmissionTime;
   
   SerialMonitor.printf("📤 Preparing to send Frame ID %d...\n", payload.payload_id);
+  feedWatchdog();
   
   uint8_t protocolFrame[64];
   int frameLength;
@@ -531,7 +586,6 @@ bool transmitBCDFrame(SensorPayload& payload) {
     frameHex += hex;
   }
   
-  // NEW: Extended payload format with timing data
   String bcdPayload = frameHex + "," + String(payload.payload_id) + "," + 
                       String(payload.measured_time) + "," + String(payload.transmitted_time) + "," +
                       String(payload.battery_voltage, 2) + "," + String(payload.battery_percentage);
@@ -554,6 +608,8 @@ bool transmitBCDFrame(SensorPayload& payload) {
                 transTm->tm_hour, transTm->tm_min, transTm->tm_sec);
   SerialMonitor.printf("⏱ Delay: %lu seconds\n", payload.transmitted_time - payload.measured_time);
   
+  feedWatchdog();
+  
   // Add extra safety check before publishing
   if (!mqtt.connected()) {
     SerialMonitor.println("⚠ MQTT disconnected during transmission attempt");
@@ -561,9 +617,10 @@ bool transmitBCDFrame(SensorPayload& payload) {
   }
   
   bool success = mqtt.publish(topic.c_str(), bcdPayload.c_str(), false);
+  feedWatchdog();
   
   if (success) {
-    payload.transmitted = true; // ✅ Mark as transmitted to prevent duplicates
+    payload.transmitted = true;
     SerialMonitor.printf("✅ Frame ID %d transmitted successfully\n", payload.payload_id);
     
     // Additional verification - check MQTT state after publish
@@ -582,11 +639,13 @@ bool transmitBCDFrame(SensorPayload& payload) {
 // MQTT Function
 void connectMQTT() {
   int attempts = 0;
-  while (!mqtt.connected() && attempts < 5) {
+  while (!mqtt.connected() && attempts < 3) {  // Reduced attempts to prevent long blocking
     SerialMonitor.print("Attempting MQTT connection...");
+    feedWatchdog();
     
     String clientId = String(deviceName) + "_" + String(random(0xffff), HEX);
     bool connected = mqtt.connect(clientId.c_str(), mqtt_user, mqtt_pass);
+    feedWatchdog();
     
     if (connected) {
       SerialMonitor.println("MQTT connected successfully!");
@@ -594,7 +653,9 @@ void connectMQTT() {
     } else {
       SerialMonitor.print("failed, rc=");
       SerialMonitor.println(mqtt.state());
-      delay(5000);
+      feedWatchdog();
+      delay(2000);  // Reduced delay
+      feedWatchdog();
       attempts++;
     }
   }
@@ -603,12 +664,14 @@ void connectMQTT() {
 void takeMeasurement() {
   SerialMonitor.println("=== TAKING MEASUREMENT ===");
   SerialMonitor.printf("Current buffer index: %d\n", bufferIndex);
+  feedWatchdog();
   
-  // ✅ FIXED: Buffer full condition - force immediate transmission
+  // Buffer full condition - force immediate transmission
   if (bufferIndex >= PAYLOAD_BUFFER_SIZE) {
     SerialMonitor.println("⚠ Buffer full! Forcing immediate transmission...");
     if (networkConnected && mqtt.connected()) {
       transmitPayloads();
+      feedWatchdog();
     } else {
       SerialMonitor.println("⚠ No network - dropping oldest payload to make room");
       // Shift buffer left to drop oldest payload
@@ -629,11 +692,13 @@ void takeMeasurement() {
     currentTime = time(nullptr);
   }
   
-  payload.timestamp = currentTime;        // Legacy field for compatibility
-  payload.measured_time = currentTime;    // NEW: Record measurement time
-  payload.transmitted_time = 0;           // NEW: Will be set when transmitted
+  payload.timestamp = currentTime;
+  payload.measured_time = currentTime;
+  payload.transmitted_time = 0;
   payload.payload_id = current_payload_id++;
-  payload.transmitted = false; // ✅ Initialize transmission status
+  payload.transmitted = false;
+  
+  feedWatchdog();
   
   // Read sensor with retry
   float temp = dht.readTemperature();
@@ -641,12 +706,12 @@ void takeMeasurement() {
   
   if (isnan(temp) || isnan(humid)) {
     delay(2000);
+    feedWatchdog();
     temp = dht.readTemperature();
     humid = dht.readHumidity();
   }
   
   // Read battery voltage and percentage
-  int analogVal = analogRead(BATTERY_ADC_PIN);
   float inputVoltage = readBatteryVoltage();
   int batteryPercent = getBatteryPercentage(inputVoltage);
   
@@ -660,7 +725,7 @@ void takeMeasurement() {
                   payload.battery_voltage > 0 && payload.battery_voltage < 5.0;
   
   if (payload.valid) {
-    bufferIndex++; // ✅ Increment AFTER storing data
+    bufferIndex++;
     
     SerialMonitor.printf("✓ Measurement %d stored: T=%.1f°C, H=%.1f%%, V=%.2fV, B=%d%%, Buffer: %d/%d\n",
                   payload.payload_id, payload.temperature, payload.humidity, 
@@ -681,29 +746,31 @@ void takeMeasurement() {
   }
 }
 
-// ✅ FIXED: Prevent duplicate transmissions with static flag
+// Prevent duplicate transmissions with static flag
 static bool transmissionInProgress = false;
 
 void transmitPayloads() {
-  // ✅ CRITICAL: Prevent re-entry during transmission
+  // Prevent re-entry during transmission
   if (transmissionInProgress) {
     SerialMonitor.println("⚠ Transmission already in progress, skipping duplicate call");
     return;
   }
   
-  transmissionInProgress = true; // Set flag to prevent re-entry
+  transmissionInProgress = true;
   
   SerialMonitor.println("=== TRANSMISSION STARTING ===");
   SerialMonitor.printf("Transmission flag set - preventing duplicates\n");
+  feedWatchdog();
   
   if (!mqtt.connected()) {
     SerialMonitor.println("MQTT not connected, attempting to connect...");
     connectMQTT();
+    feedWatchdog();
   }
   
   if (!mqtt.connected()) {
     SerialMonitor.println("MQTT connection failed, skipping transmission");
-    transmissionInProgress = false; // Clear flag before exit
+    transmissionInProgress = false;
     return;
   }
   
@@ -714,6 +781,7 @@ void transmitPayloads() {
   int alreadySent = 0;
   
   for (int i = 0; i < bufferIndex; i++) {
+    feedWatchdog();
     if (rtc_payload_buffer[i].valid) {
       if (rtc_payload_buffer[i].transmitted) {
         alreadySent++;
@@ -723,7 +791,8 @@ void transmitPayloads() {
         if (transmitBCDFrame(rtc_payload_buffer[i])) {
           transmitted++;
         }
-        delay(500); // Increased delay between transmissions
+        feedWatchdog();
+        delay(500);
       }
     } else {
       skipped++;
@@ -733,7 +802,7 @@ void transmitPayloads() {
   SerialMonitor.printf("✓ Transmission complete: %d transmitted, %d already sent, %d skipped\n", 
                 transmitted, alreadySent, skipped);
   
-  // ✅ FIXED: Only clear buffer if at least some payloads were transmitted
+  // Only clear buffer if at least some payloads were transmitted
   if (transmitted > 0) {
     // Check if all valid payloads have been transmitted
     bool allTransmitted = true;
@@ -745,14 +814,14 @@ void transmitPayloads() {
     }
     
     if (allTransmitted) {
-      bufferIndex = 0; // Clear buffer completely
+      bufferIndex = 0;
       SerialMonitor.println("✓ All payloads transmitted - buffer cleared");
     } else {
       SerialMonitor.printf("⚠ Some payloads not transmitted - buffer retained (%d payloads)\n", bufferIndex);
     }
   }
   
-  transmissionInProgress = false; // Clear flag when done
+  transmissionInProgress = false;
   SerialMonitor.println("✓ Transmission flag cleared");
 }
 
@@ -773,12 +842,20 @@ void handleSerialCommands() {
     } else if (command == "clear" || command == "c") {
       bufferIndex = 0;
       SerialMonitor.println("✓ Buffer cleared manually");
+    } else if (command == "calibrate" || command == "cal") {
+      calibrateBatteryVoltage();
+    } else if (command == "battery" || command == "b") {
+      float voltage = readBatteryVoltage();
+      int percentage = getBatteryPercentage(voltage);
+      SerialMonitor.printf("Battery: %.3fV (%d%%)\n", voltage, percentage);
     } else if (command == "help" || command == "h") {
       SerialMonitor.println("=== AVAILABLE COMMANDS ===");
       SerialMonitor.println("m/measure  - Take measurement now");
       SerialMonitor.println("t/transmit - Transmit data now");
       SerialMonitor.println("s/status   - Show system status");
       SerialMonitor.println("c/clear    - Clear buffer");
+      SerialMonitor.println("b/battery  - Show battery voltage");
+      SerialMonitor.println("cal/calibrate - Calibrate battery voltage");
       SerialMonitor.println("h/help     - Show this help");
     }
   }
@@ -795,7 +872,6 @@ void displaySystemStatus() {
   SerialMonitor.printf("Time synced: %s\n", timeIsSynced ? "YES" : "NO");
   
   // Show current battery status
-  int analogVal = analogRead(BATTERY_ADC_PIN);
   float inputVoltage = readBatteryVoltage();
   int batteryPercent = getBatteryPercentage(inputVoltage);
   SerialMonitor.printf("Battery: %.2fV (%d%%)\n", inputVoltage, batteryPercent);
@@ -857,8 +933,7 @@ void enterDeepSleep() {
   SerialMonitor.printf("Will sleep for %lu seconds\n", sleepTime);
   SerialMonitor.printf("RTC buffer contains %d payloads (will survive sleep)\n", bufferIndex);
   
-  // ✅ RTC data is automatically preserved - no need to save/restore
-  rtc_first_boot = false; // Mark that we've been running
+  rtc_first_boot = false;
   
   if (mqtt.connected()) {
     SerialMonitor.println("Disconnecting MQTT...");
@@ -872,6 +947,13 @@ void enterDeepSleep() {
   
   digitalWrite(MODEM_POWER_ON, LOW);
   digitalWrite(LED_GPIO, LED_OFF);
+
+  SerialMonitor.println("Disabling watchdog before deep sleep...");
+  if (watchdogInitialized) {
+    esp_task_wdt_delete(NULL);
+    esp_task_wdt_deinit();
+    watchdogInitialized = false;
+  }
   
   esp_sleep_enable_timer_wakeup(sleepTime * 1000000ULL);
   
@@ -900,16 +982,17 @@ void handleWakeUp() {
       break;
   }
   
-  // ✅ RTC variables are automatically preserved - just reset network flags
+  // Reset network flags after wake-up
   networkConnected = false;
   timeIsSynced = false;
   
   SerialMonitor.printf("✓ Restored from RTC: %d payloads, next ID: %d\n", 
                 bufferIndex, current_payload_id);
+
   SerialMonitor.println("=== WAKE UP COMPLETE ===");
 }
 
-// ✅ FIXED: Improved sleep condition logic
+// Improved sleep condition logic
 bool shouldEnterDeepSleep() {
   unsigned long currentTime = millis();
   unsigned long timeToNextMeasurement = (MEASUREMENT_INTERVAL * 1000UL) - (currentTime - lastMeasurement);
@@ -919,7 +1002,7 @@ bool shouldEnterDeepSleep() {
     return false; // No deep sleep in dev mode
   #endif
   
-  // ✅ FIXED: Allow sleep when buffer has room OR when buffer is full but transmitted
+  // Allow sleep when buffer has room OR when buffer is full but transmitted
   bool bufferHasRoom = (bufferIndex < PAYLOAD_BUFFER_SIZE);
   
   // Check if all payloads in buffer are transmitted
@@ -952,28 +1035,35 @@ bool shouldEnterDeepSleep() {
 void setupModemAndNetwork() {
   setupModem();
   SerialAT.begin(115200, SERIAL_8N1, MODEM_RX, MODEM_TX);
-  delay(6000);
+  delay(3000);  // Reduced initial delay
+  feedWatchdog();
 
   SerialMonitor.println("Initializing modem...");
   modem.restart();
+  feedWatchdog();
 
   String modemInfo = modem.getModemInfo();
   SerialMonitor.print("Modem Info: ");
   SerialMonitor.println(modemInfo);
+  feedWatchdog();
 
   #if TINY_GSM_USE_GPRS
   if (GSM_PIN && modem.getSimStatus() != 3) {
       modem.simUnlock(GSM_PIN);
+      feedWatchdog();
   }
   #endif
 
   SerialMonitor.print("Waiting for network...");
   if (!modem.waitForNetwork()) {
       SerialMonitor.println(" fail");
-      delay(10000);
+      feedWatchdog();
+      delay(5000);  // Reduced delay
+      feedWatchdog();
       return;
   }
   SerialMonitor.println(" success");
+  feedWatchdog();
 
   if (modem.isNetworkConnected()) {
       SerialMonitor.println("Network connected");
@@ -984,16 +1074,20 @@ void setupModemAndNetwork() {
   SerialMonitor.print(apn);
   if (!modem.gprsConnect(apn, gprsUser, gprsPass)) {
       SerialMonitor.println(" fail");
-      delay(10000);
+      feedWatchdog();
+      delay(5000);  // Reduced delay
+      feedWatchdog();
       return;
   }
   SerialMonitor.println(" success");
+  feedWatchdog();
 
   if (modem.isGprsConnected()) {
       SerialMonitor.println("GPRS connected");
   }
 
   mqtt.setServer(broker, 1883);
+  feedWatchdog();
   
   if (syncPreciseNetworkTime()) {
       SerialMonitor.println("Time synchronized with cellular network");
@@ -1001,32 +1095,157 @@ void setupModemAndNetwork() {
   } else {
       SerialMonitor.println("Warning: Time sync failed");
   }
+  feedWatchdog();
 }
 
-int getBatteryPercentage(float voltage) {
-  if (voltage >= 4.1) return 100;
-  if (voltage >= 3.9) return 80;
-  if (voltage >= 3.8) return 60;
-  if (voltage >= 3.7) return 40;
-  if (voltage >= 3.6) return 20;
-  if (voltage >= 3.4) return 10;
-  return 0;
+void initializeBatteryADC() {
+  // Configure ADC resolution and attenuation for GPIO35
+  analogReadResolution(12);
+  analogSetAttenuation(ADC_11db);
+  analogSetPinAttenuation(BATTERY_ADC_PIN, ADC_11db);
+  
+  SerialMonitor.println("=== ADC INITIALIZATION ===");
+  SerialMonitor.printf("ADC Pin: GPIO%d\n", BATTERY_ADC_PIN);
+  SerialMonitor.printf("ADC Resolution: 12-bit (0-%d)\n", ADC_RESOLUTION - 1);
+  SerialMonitor.printf("ADC Attenuation: 11dB (0-3.3V range)\n");
+  SerialMonitor.printf("Voltage Divider Ratio: %.2f\n", VOLTAGE_DIVIDER_RATIO);
+  SerialMonitor.println("=============================");
 }
 
 float readBatteryVoltage() {
-  // Take multiple samples and average them to reduce noise
-  const int NUM_SAMPLES = 10;
-  int sum = 0;
-  
-  for (int i = 0; i < NUM_SAMPLES; i++) {
-    sum += analogRead(BATTERY_ADC_PIN);
-    delay(10); // Small delay between samples
+  // Let ADC settle
+  for (int i = 0; i < 3; i++) {
+    analogRead(BATTERY_ADC_PIN);
+    delay(10);
   }
   
-  float avgAnalogVal = sum / (float)NUM_SAMPLES;
+  // Take 3 readings
+  float readings[3];
+  for (int i = 0; i < 3; i++) {
+    uint32_t adc_sum = 0;
+    for (int j = 0; j < 10; j++) {
+      adc_sum += analogRead(BATTERY_ADC_PIN);
+      delay(5);
+    }
+    
+    float adc_voltage = ((float)(adc_sum/10) / ADC_RESOLUTION) * ADC_VREF;
+    //if (adc_voltage > 2.5) adc_voltage = adc_voltage * 1.05 + 0.1;
+    
+    readings[i] = (adc_voltage * VOLTAGE_DIVIDER_RATIO);
+    if (i < 2) delay(50);
+  }
   
-  // Use your existing formula but with averaged reading
-  float inputVoltage = ((avgAnalogVal / 4096.0) * 3.3) * 2.068;
+  // Find and remove outlier, return average of remaining two
+  float distances[3] = {
+    abs(readings[0] - readings[1]) + abs(readings[0] - readings[2]),
+    abs(readings[1] - readings[0]) + abs(readings[1] - readings[2]), 
+    abs(readings[2] - readings[0]) + abs(readings[2] - readings[1])
+  };
   
-  return inputVoltage;
+  // Find index with largest total distance (the outlier)
+  int outlier = (distances[0] > distances[1]) ? 
+                ((distances[0] > distances[2]) ? 0 : 2) : 
+                ((distances[1] > distances[2]) ? 1 : 2);
+  
+  // Average the two non-outlier readings
+  float result = (readings[0] + readings[1] + readings[2] - readings[outlier]) / 2.0;
+  return result + 0.2;  // Add 0.2V offset
+}
+
+// Enhanced battery percentage calculation with better curve
+int getBatteryPercentage(float voltage) {
+  // More accurate LiPo discharge curve
+  const float BATTERY_MAX = 4.20;  // Maximum battery voltage
+  const float BATTERY_MIN = 3.20;  // Minimum safe battery voltage
+  
+  if (voltage >= BATTERY_MAX) return 100;
+  if (voltage <= BATTERY_MIN) return 0;
+  
+  // Use a more accurate discharge curve for LiPo batteries
+  float percentage;
+  
+  if (voltage > 4.0) {
+    // Above 4.0V: steep curve (80-100%)
+    percentage = 80 + (voltage - 4.0) * 100;
+  } else if (voltage > 3.8) {
+    // 3.8-4.0V: moderate curve (40-80%)
+    percentage = 40 + (voltage - 3.8) * 200;
+  } else if (voltage > 3.6) {
+    // 3.6-3.8V: gentler curve (20-40%)
+    percentage = 20 + (voltage - 3.6) * 100;
+  } else if (voltage > 3.4) {
+    // 3.4-3.6V: steep drop (5-20%)
+    percentage = 5 + (voltage - 3.4) * 75;
+  } else {
+    // Below 3.4V: very low (0-5%)
+    percentage = (voltage - BATTERY_MIN) * 25;
+  }
+  
+  // Clamp to 0-100%
+  if (percentage > 100) percentage = 100;
+  if (percentage < 0) percentage = 0;
+  
+  return (int)percentage;
+}
+
+// Add this function to help with calibration
+void calibrateBatteryVoltage() {
+  SerialMonitor.println("=== BATTERY VOLTAGE CALIBRATION ===");
+  SerialMonitor.println("Please measure actual battery voltage with multimeter");
+  SerialMonitor.println("Taking 20 readings...");
+  
+  float total = 0;
+  for (int i = 0; i < 20; i++) {
+    float voltage = readBatteryVoltage();
+    total += voltage;
+    SerialMonitor.printf("Reading %d: %.3fV\n", i+1, voltage);
+    delay(500);
+    feedWatchdog();
+  }
+  
+  float average = total / 20;
+  SerialMonitor.printf("Average measured: %.3fV\n", average);
+  SerialMonitor.println("Compare with multimeter reading to calculate correction factors");
+  SerialMonitor.println("=====================================");
+}
+
+void initializeWatchdog() {
+  // Only initialize if not already done
+  if (watchdogInitialized) {
+    SerialMonitor.println("⚠ Watchdog already initialized, skipping");
+    return;
+  }
+  
+  SerialMonitor.println("=== INITIALIZING WATCHDOG ===");
+  
+  // Configure watchdog timer with new API
+  esp_task_wdt_config_t twdt_config = {
+    .timeout_ms = WDT_TIMEOUT * 1000,
+    .idle_core_mask = (1 << portNUM_PROCESSORS) - 1,
+    .trigger_panic = true
+  };
+  
+  esp_err_t result = esp_task_wdt_init(&twdt_config);
+  if (result != ESP_OK) {
+    SerialMonitor.printf("⚠ Watchdog init failed: %d\n", result);
+    return;
+  }
+  
+  result = esp_task_wdt_add(NULL);
+  if (result != ESP_OK) {
+    SerialMonitor.printf("⚠ Failed to add task to watchdog: %d\n", result);
+    return;
+  }
+  
+  watchdogInitialized = true;
+  
+  SerialMonitor.printf("Watchdog initialized: %d second timeout\n", WDT_TIMEOUT);
+  SerialMonitor.println("System will auto-reset if hung for >30s");
+  SerialMonitor.println("==============================");
+}
+
+void feedWatchdog() {
+  if (watchdogInitialized) {
+    esp_task_wdt_reset();
+  }
 }
